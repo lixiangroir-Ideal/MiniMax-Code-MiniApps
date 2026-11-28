@@ -2126,7 +2126,6 @@
         var CARD_KEYS = ['weather', 'stocks', 'news'];
         /* 拖动尺寸时的边界 */
         var MIN_CARD_W = 260;
-        var MIN_SIB_W = 240;
         var MIN_CARD_H = 220;
         var MAX_CARD_H = 1600;
         var BOARD_GAP = 16;
@@ -2154,31 +2153,94 @@
           return 3;
         }
 
-        /* 2 栏排布下天气列的默认宽度，与 CSS 的 clamp(184px, 30%, 268px) 保持一致 */
-        function defaultWeatherTrack(w) {
-          return Math.min(268, Math.max(184, w * 0.3));
+        /* 当前排布下每一行放了哪些卡片：同一行的宽度加起来不能超过看板宽度 */
+        function layoutRows() {
+          var cols = layoutColumns();
+          if (cols === 1) return [['weather'], ['stocks'], ['news']];
+          if (cols === 2) return [['weather', 'stocks'], ['news']];
+          return [['weather', 'stocks', 'news']];
         }
 
         /**
-         * 某张卡片允许的最大宽度：给同一行的其他卡片留出可读空间，
-         * 避免把兄弟卡片挤成一条缝。
+         * 某张卡片允许的最大宽度：同一行里其它卡片按各自当前的宽度让出空间。
+         * 兄弟卡片如果也被手动指定过宽度，就按它实际占的宽度算，
+         * 否则整行加起来会超出看板宽度，右侧会被裁掉且滚不到。
          */
         function maxCardWidth(key) {
           var w = boardWidth();
           if (!w) return MIN_CARD_W;
           var cols = layoutColumns();
           if (cols === 1) return w;
-          if (cols === 2) {
-            // 新闻卡横跨整行，其余两张并排
-            if (key === 'news') return w;
-            var other = key === 'weather' ? MIN_SIB_W : defaultWeatherTrack(w);
-            return Math.max(MIN_CARD_W, w - BOARD_GAP - other);
-          }
+          var row = null;
+          layoutRows().forEach(function (r) {
+            if (r.indexOf(key) >= 0) row = r;
+          });
+          if (!row) return w;
           var others = 0;
-          if (key !== 'weather') others += 210;
-          if (key !== 'stocks') others += 320;
-          if (key !== 'news') others += 280;
-          return Math.max(MIN_CARD_W, w - BOARD_GAP * 2 - others);
+          row.forEach(function (k) {
+            if (k === key) return;
+            /* 兄弟卡片各留出最小宽度：这样逐张算出来的上限与处理顺序无关，
+               不会因为先处理哪一张就把另一张压到下限 */
+            others += MIN_CARD_W;
+          });
+          var gaps = BOARD_GAP * (row.length - 1);
+          return Math.max(MIN_CARD_W, w - gaps - others);
+        }
+
+        /**
+         * 同一行的手动宽度加起来可能超出看板宽度，这里按比例收回。
+         * 溢出量按渲染结果测量，和浏览器实际的轨道分配保持一致；
+         * 多张卡一样宽时按各自宽度分摊，不偏向行里的第一张。
+         * keepKey 是正在拖动的那张卡：先让兄弟卡片让出空间，兄弟都到底了才动它自己。
+         */
+        function fitCardWidths(keepKey) {
+          var w = boardWidth();
+          if (!w) return false;
+          var changed = false;
+          var floor = Math.min(MIN_CARD_W, w);
+          layoutRows().forEach(function (row) {
+            var guard = 0;
+            while (guard < 12) {
+              guard += 1;
+              var total = 0;
+              row.forEach(function (key) {
+                var card = cardElement(key);
+                if (card) total += card.getBoundingClientRect().width;
+              });
+              var over = total + BOARD_GAP * (row.length - 1) - w;
+              if (over <= 0) break;
+              var pool = row.filter(function (key) {
+                var size = cardSizes[key];
+                return size.w && size.w > floor && !(keepKey && key === keepKey);
+              });
+              if (!pool.length) {
+                pool = row.filter(function (key) {
+                  var size = cardSizes[key];
+                  return size.w && size.w > floor;
+                });
+              }
+              if (!pool.length) break;
+              var sum = 0;
+              pool.forEach(function (key) {
+                sum += cardSizes[key].w;
+              });
+              var progressed = false;
+              pool.forEach(function (key) {
+                var size = cardSizes[key];
+                var share = over * (size.w / sum);
+                var next = Math.max(floor, Math.round(size.w - share));
+                if (next < size.w) {
+                  size.w = next;
+                  changed = true;
+                  progressed = true;
+                }
+              });
+              if (!progressed) break;
+              /* 收到新宽度后重新布局，下一轮才能量到真实溢出 */
+              applyCardSizes();
+            }
+          });
+          return changed;
         }
 
         function applyCardSizes() {
@@ -2275,6 +2337,10 @@
               }
             }
           });
+          /* 先把逐张夹紧的结果落到布局上，再按实际渲染结果收敛整行 */
+          if (changed) applyCardSizes();
+          /* 同一行的手动宽度加起来不能超出看板宽度，超出时按比例收回来 */
+          if (fitCardWidths()) changed = true;
           if (changed) {
             applyCardSizes();
             saveCardSizes();
@@ -2322,16 +2388,20 @@
               moved = true;
             }
             if (event.cancelable) event.preventDefault();
-            var maxW = maxCardWidth(key);
             var minW = Math.min(MIN_CARD_W, boardWidth());
-            var w = Math.round(Math.min(maxW, Math.max(minW, event.clientX - start.left)));
+            var w = Math.round(Math.max(minW, event.clientX - start.left));
             var h = Math.round(
               Math.min(MAX_CARD_H, Math.max(MIN_CARD_H, event.clientY - start.top)),
             );
             cardSizes[key].w = w;
             cardSizes[key].h = h;
+            /* 先落到布局上，再按实际渲染结果收敛：同一行的总宽度不能超出看板，
+               先让兄弟卡片让出空间，实在放不下才收这张 */
             applyCardSizes();
-            showSizeBadge(w + ' × ' + h, event.clientX, event.clientY);
+            fitCardWidths(key);
+            applyCardSizes();
+            /* 提示上的尺寸用实际生效的宽度，而不是夹紧之前的那个 */
+            showSizeBadge(cardSizes[key].w + ' × ' + cardSizes[key].h, event.clientX, event.clientY);
             if (!sizeSaveTimer) {
               sizeSaveTimer = setTimeout(function () {
                 sizeSaveTimer = 0;
@@ -2565,6 +2635,17 @@
             scheduleWeatherTune();
           });
           if (el.stocksCard) stocksObserver.observe(el.stocksCard);
+          // 看板的可用宽度变了（面板变窄，或者内容变高后出现竖向滚动条、
+          // 可用宽度少掉十几像素），手动指定的宽度要重新收敛一次。
+          var lastBoardWidth = boardWidth();
+          var boardObserver = new ResizeObserver(function () {
+            var w = boardWidth();
+            if (!w || w === lastBoardWidth) return;
+            lastBoardWidth = w;
+            clampCardSizes();
+            scheduleWeatherTune();
+          });
+          if (el.board) boardObserver.observe(el.board);
         }
         window.addEventListener('resize', function () {
           clampCardSizes();
